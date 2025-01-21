@@ -9,7 +9,7 @@ At the minimum, we recommend:
 - 2 CPU cores
 
 You can use any Linux distribution, but [our
-docs](https://coder.com/docs/code-server/v3.11.0/guide) assume that you're using
+docs](https://coder.com/docs/code-server/latest/guide) assume that you're using
 Debian hosted by Google Cloud (see the following section for instructions on
 setting this up).
 
@@ -21,8 +21,8 @@ for communication between the browser and the server.
 The following steps walk you through setting up a VM running Debian using Google
 Cloud (though you are welcome to use any machine or VM provider).
 
-If you're [signing up with Google](https://console.cloud.google.com/getting-started) for the first time, you should get a 12-month trial with
-$300 of credits.
+If you're [signing up with Google](https://console.cloud.google.com/getting-started) for the first time, you should get a 3-month trial with
+\$300 of credits.
 
 After you sign up and create a new Google Cloud Provider (GCP) project, create a
 new Compute Engine VM instance:
@@ -33,7 +33,7 @@ new Compute Engine VM instance:
 4. Choose the **region** that's closest to you based on [GCP
    ping](https://gcping.com/).
 5. Choose a **zone** (any option is fine).
-6. We recommend choose an **E2 series instance** from the [general-purpose
+6. We recommend choosing an **E2 series instance** from the [general-purpose
    family](https://cloud.google.com/compute/docs/machine-types#general_purpose).
 7. Change the instance type to **custom** and set at least **2 cores** and **2
    GB of RAM**. You can add more resources if desired, though you can also edit
@@ -53,3 +53,4 @@ Notes:
 
 - To lower costs, you can shut down your server when you're not using it.
 - We recommend using the `gcloud cli` to avoid using the GCP Dashboard if possible.
+- For serving code-server over HTTPS, we recommend using an external domain name along with a service such as Let's Encrypt

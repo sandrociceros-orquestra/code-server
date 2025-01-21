@@ -1,29 +1,20 @@
 import * as cp from "child_process"
-import * as fs from "fs"
+import { promises as fs } from "fs"
 import * as path from "path"
 import util from "util"
-import { tmpdir } from "../utils/helpers"
+import { clean, getMaybeProxiedCodeServer, tmpdir } from "../utils/helpers"
 import { describe, expect, test } from "./baseFixture"
 
-describe("Integrated Terminal", true, () => {
-  // Create a new context with the saved storage state
-  // so we don't have to logged in
-  const testFileName = "pipe"
-  const testString = "new string test from e2e test"
-  let tmpFolderPath = ""
-  let tmpFile = ""
-
+describe("Integrated Terminal", ["--disable-workspace-trust"], {}, () => {
+  const testName = "integrated-terminal"
   test.beforeAll(async () => {
-    tmpFolderPath = await tmpdir("integrated-terminal")
-    tmpFile = path.join(tmpFolderPath, testFileName)
+    await clean(testName)
   })
 
-  test.afterAll(async () => {
-    // Ensure directory was removed
-    await fs.promises.rmdir(tmpFolderPath, { recursive: true })
-  })
+  test("should have access to VSCODE_PROXY_URI", async ({ codeServerPage }) => {
+    const tmpFolderPath = await tmpdir(testName)
+    const tmpFile = path.join(tmpFolderPath, "pipe")
 
-  test("should echo a string to a file", async ({ codeServerPage }) => {
     const command = `mkfifo '${tmpFile}' && cat '${tmpFile}'`
     const exec = util.promisify(cp.exec)
     const output = exec(command, { encoding: "utf8" })
@@ -31,13 +22,32 @@ describe("Integrated Terminal", true, () => {
     // Open terminal and type in value
     await codeServerPage.focusTerminal()
 
-    await codeServerPage.page.waitForLoadState("load")
-    await codeServerPage.page.keyboard.type(`echo ${testString} > ${tmpFile}`)
+    await codeServerPage.page.keyboard.type(`printenv VSCODE_PROXY_URI > ${tmpFile}`)
     await codeServerPage.page.keyboard.press("Enter")
-    // It may take a second to process
-    await codeServerPage.page.waitForTimeout(1000)
 
     const { stdout } = await output
-    expect(stdout).toMatch(testString)
+    const address = await getMaybeProxiedCodeServer(codeServerPage)
+    expect(stdout).toMatch(address)
+  })
+
+  // TODO@jsjoeio - add test to make sure full code-server path works
+  test("should be able to invoke `code-server` to open a file", async ({ codeServerPage }) => {
+    const tmpFolderPath = await tmpdir(testName)
+    const tmpFile = path.join(tmpFolderPath, "test-file")
+    await fs.writeFile(tmpFile, "test")
+
+    await codeServerPage.focusTerminal()
+
+    await codeServerPage.page.keyboard.type(`code-server ${tmpFile}`)
+    await codeServerPage.page.keyboard.press("Enter")
+
+    await codeServerPage.waitForTab(path.basename(tmpFile))
+
+    const externalTmpFile = path.join(tmpFolderPath, "test-external-file")
+    await fs.writeFile(externalTmpFile, "foobar")
+
+    await codeServerPage.openFileExternally(externalTmpFile)
+
+    await codeServerPage.waitForTab(path.basename(externalTmpFile))
   })
 })

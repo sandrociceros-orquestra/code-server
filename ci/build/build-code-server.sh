@@ -14,24 +14,6 @@ main() {
     sed -i.bak "1s;^;#!/usr/bin/env node\n;" out/node/entry.js && rm out/node/entry.js.bak
     chmod +x out/node/entry.js
   fi
-
-  if ! [ -f ./lib/coder-cloud-agent ]; then
-    echo "Downloading the cloud agent..."
-
-    # for arch; we do not use OS from lib.sh and get our own.
-    # lib.sh normalizes macos to darwin - but cloud-agent's binaries do not
-    source ./ci/lib.sh
-    OS="$(uname | tr '[:upper:]' '[:lower:]')"
-
-    set +e
-    curl -fsSL "https://github.com/cdr/cloud-agent/releases/latest/download/cloud-agent-$OS-$ARCH" -o ./lib/coder-cloud-agent
-    chmod +x ./lib/coder-cloud-agent
-    set -e
-  fi
-
-  yarn browserify out/browser/register.js -o out/browser/register.browserified.js
-  yarn browserify out/browser/pages/login.js -o out/browser/pages/login.browserified.js
-  yarn browserify out/browser/pages/vscode.js -o out/browser/pages/vscode.browserified.js
 }
 
 main "$@"

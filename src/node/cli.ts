@@ -1,14 +1,13 @@
 import { field, Level, logger } from "@coder/logger"
 import { promises as fs } from "fs"
-import yaml from "js-yaml"
-import * as os from "os"
+import { load } from "js-yaml"
 import * as path from "path"
-import { Args as VsArgs } from "../../typings/ipc"
-import { canConnect, generateCertificate, generatePassword, humanPath, paths } from "./util"
+import { generateCertificate, generatePassword, paths, splitOnFirstEquals } from "./util"
+import { EditorSessionManagerClient } from "./vscodeSocket"
 
 export enum Feature {
-  /** Web socket compression. */
-  PermessageDeflate = "permessage-deflate",
+  // No current experimental features!
+  Placeholder = "placeholder",
 }
 
 export enum AuthType {
@@ -30,7 +29,40 @@ export enum LogLevel {
 
 export class OptionalString extends Optional<string> {}
 
-export interface Args extends VsArgs {
+/**
+ * Code flags provided by the user.
+ */
+export interface UserProvidedCodeArgs {
+  "disable-telemetry"?: boolean
+  force?: boolean
+  "user-data-dir"?: string
+  "enable-proposed-api"?: string[]
+  "extensions-dir"?: string
+  "builtin-extensions-dir"?: string
+  "install-extension"?: string[]
+  "uninstall-extension"?: string[]
+  "list-extensions"?: boolean
+  "locate-extension"?: string[]
+  "show-versions"?: boolean
+  category?: string
+  "github-auth"?: string
+  "disable-update-check"?: boolean
+  "disable-file-downloads"?: boolean
+  "disable-file-uploads"?: boolean
+  "disable-workspace-trust"?: boolean
+  "disable-getting-started-override"?: boolean
+  "disable-proxy"?: boolean
+  "session-socket"?: string
+  "abs-proxy-base-path"?: string
+}
+
+/**
+ * Arguments that the user explicitly provided on the command line.  All
+ * arguments must be optional.
+ *
+ * For arguments with defaults see DefaultedArgs.
+ */
+export interface UserProvidedArgs extends UserProvidedCodeArgs {
   config?: string
   auth?: AuthType
   password?: string
@@ -38,30 +70,28 @@ export interface Args extends VsArgs {
   cert?: OptionalString
   "cert-host"?: string
   "cert-key"?: string
-  "disable-telemetry"?: boolean
-  "disable-update-check"?: boolean
   enable?: string[]
   help?: boolean
   host?: string
+  locale?: string
+  port?: number
   json?: boolean
   log?: LogLevel
   open?: boolean
-  port?: number
   "bind-addr"?: string
   socket?: string
+  "socket-mode"?: string
+  "trusted-origins"?: string[]
   version?: boolean
-  force?: boolean
-  "list-extensions"?: boolean
-  "install-extension"?: string[]
-  "show-versions"?: boolean
-  "uninstall-extension"?: string[]
   "proxy-domain"?: string[]
-  locale?: string
-  _: string[]
   "reuse-window"?: boolean
   "new-window"?: boolean
-
-  link?: OptionalString
+  "ignore-last-opened"?: boolean
+  verbose?: boolean
+  "app-name"?: string
+  "welcome-text"?: string
+  /* Positional arguments. */
+  _?: string[]
 }
 
 interface Option<T> {
@@ -80,32 +110,32 @@ interface Option<T> {
   description?: string
 
   /**
-   * If marked as beta, the option is marked as beta in help.
+   * If marked as deprecated, the option is marked as deprecated in help.
    */
-  beta?: boolean
+  deprecated?: boolean
 }
 
 type OptionType<T> = T extends boolean
   ? "boolean"
   : T extends OptionalString
-  ? typeof OptionalString
-  : T extends LogLevel
-  ? typeof LogLevel
-  : T extends AuthType
-  ? typeof AuthType
-  : T extends number
-  ? "number"
-  : T extends string
-  ? "string"
-  : T extends string[]
-  ? "string[]"
-  : "unknown"
+    ? typeof OptionalString
+    : T extends LogLevel
+      ? typeof LogLevel
+      : T extends AuthType
+        ? typeof AuthType
+        : T extends number
+          ? "number"
+          : T extends string
+            ? "string"
+            : T extends string[]
+              ? "string[]"
+              : "unknown"
 
-type Options<T> = {
+export type Options<T> = {
   [P in keyof T]: Option<OptionType<T[P]>>
 }
 
-const options: Options<Required<Args>> = {
+export const options: Options<Required<UserProvidedArgs>> = {
   auth: { type: AuthType, description: "The type of authentication to use." },
   password: {
     type: "string",
@@ -134,11 +164,43 @@ const options: Options<Required<Args>> = {
       "Disable update check. Without this flag, code-server checks every 6 hours against the latest github release and \n" +
       "then notifies you once every week that a new release is available.",
   },
+  "session-socket": {
+    type: "string",
+  },
+  "disable-file-downloads": {
+    type: "boolean",
+    description:
+      "Disable file downloads from Code. This can also be set with CS_DISABLE_FILE_DOWNLOADS set to 'true' or '1'.",
+  },
+  "disable-file-uploads": {
+    type: "boolean",
+    description: "Disable file uploads.",
+  },
+  "disable-workspace-trust": {
+    type: "boolean",
+    description: "Disable Workspace Trust feature. This switch only affects the current session.",
+  },
+  "disable-getting-started-override": {
+    type: "boolean",
+    description: "Disable the coder/coder override in the Help: Getting Started page.",
+  },
+  "disable-proxy": {
+    type: "boolean",
+    description: "Disable domain and path proxy routes.",
+  },
   // --enable can be used to enable experimental features. These features
   // provide no guarantees.
   enable: { type: "string[]" },
   help: { type: "boolean", short: "h", description: "Show this output." },
   json: { type: "boolean" },
+  locale: {
+    // The preferred way to set the locale is via the UI.
+    type: "string",
+    description: `
+      Set vscode display language and language to show on the login page, more info see
+      https://en.wikipedia.org/wiki/IETF_language_tag
+    `,
+  },
   open: { type: "boolean", description: "Open in browser on startup. Does not work remotely." },
 
   "bind-addr": {
@@ -156,16 +218,22 @@ const options: Options<Required<Args>> = {
   port: { type: "number", description: "" },
 
   socket: { type: "string", path: true, description: "Path to a socket (bind-addr will be ignored)." },
+  "socket-mode": { type: "string", description: "File mode of the socket." },
+  "trusted-origins": {
+    type: "string[]",
+    description:
+      "Disables authenticate origin check for trusted origin. Useful if not able to access reverse proxy configuration.",
+  },
   version: { type: "boolean", short: "v", description: "Display version information." },
   _: { type: "string[]" },
 
   "user-data-dir": { type: "string", path: true, description: "Path to the user data directory." },
   "extensions-dir": { type: "string", path: true, description: "Path to the extensions directory." },
   "builtin-extensions-dir": { type: "string", path: true },
-  "extra-extensions-dir": { type: "string[]", path: true },
-  "extra-builtin-extensions-dir": { type: "string[]", path: true },
   "list-extensions": { type: "boolean", description: "List installed VS Code extensions." },
   force: { type: "boolean", description: "Avoid prompts when installing VS Code extensions." },
+  "locate-extension": { type: "string[]" },
+  category: { type: "string" },
   "install-extension": {
     type: "string[]",
     description:
@@ -179,6 +247,10 @@ const options: Options<Required<Args>> = {
   },
   "uninstall-extension": { type: "string[]", description: "Uninstall a VS Code extension by id." },
   "show-versions": { type: "boolean", description: "Show VS Code extension versions." },
+  "github-auth": {
+    type: "string",
+    description: "GitHub authentication token (can only be passed in via $GITHUB_TOKEN or the config file).",
+  },
   "proxy-domain": { type: "string[]", description: "Domain used for proxying ports." },
   "ignore-last-opened": {
     type: "boolean",
@@ -196,23 +268,26 @@ const options: Options<Required<Args>> = {
     description: "Force to open a file or folder in an already opened window.",
   },
 
-  locale: { type: "string" },
   log: { type: LogLevel },
   verbose: { type: "boolean", short: "vvv", description: "Enable verbose logging." },
-
-  link: {
-    type: OptionalString,
-    description: `
-      Securely bind code-server via our cloud service with the passed name. You'll get a URL like
-      https://hostname-username.cdr.co at which you can easily access your code-server instance.
-      Authorization is done via GitHub.
-    `,
-    beta: true,
+  "app-name": {
+    type: "string",
+    short: "an",
+    description: "The name to use in branding. Will be shown in titlebar and welcome message",
+  },
+  "welcome-text": {
+    type: "string",
+    short: "w",
+    description: "Text to show on login page",
+  },
+  "abs-proxy-base-path": {
+    type: "string",
+    description: "The base path to prefix to all absproxy requests",
   },
 }
 
-export const optionDescriptions = (): string[] => {
-  const entries = Object.entries(options).filter(([, v]) => !!v.description)
+export const optionDescriptions = (opts: Partial<Options<Required<UserProvidedArgs>>> = options): string[] => {
+  const entries = Object.entries(opts).filter(([, v]) => !!v.description)
   const widths = entries.reduce(
     (prev, [k, v]) => ({
       long: k.length > prev.long ? k.length : prev.long,
@@ -230,7 +305,7 @@ export const optionDescriptions = (): string[] => {
         .map((line, i) => {
           line = line.trim()
           if (i === 0) {
-            return " ".repeat(widths.long - k.length) + (v.beta ? "(beta) " : "") + line
+            return " ".repeat(widths.long - k.length) + (v.deprecated ? "(deprecated) " : "") + line
           }
           return " ".repeat(widths.long + widths.short + 6) + line
         })
@@ -240,25 +315,16 @@ export const optionDescriptions = (): string[] => {
   })
 }
 
-export function splitOnFirstEquals(str: string): string[] {
-  // we use regex instead of "=" to ensure we split at the first
-  // "=" and return the following substring with it
-  // important for the hashed-password which looks like this
-  // $argon2i$v=19$m=4096,t=3,p=1$0qR/o+0t00hsbJFQCKSfdQ$oFcM4rL6o+B7oxpuA4qlXubypbBPsf+8L531U7P9HYY
-  // 2 means return two items
-  // Source: https://stackoverflow.com/a/4607799/3015595
-  // We use the ? to say the the substr after the = is optional
-  const split = str.split(/=(.+)?/, 2)
-
-  return split
-}
-
+/**
+ * Parse arguments into UserProvidedArgs.  This should not go beyond checking
+ * that arguments are valid types and have values when required.
+ */
 export const parse = (
   argv: string[],
   opts?: {
     configFile?: string
   },
-): Args => {
+): UserProvidedArgs => {
   const error = (msg: string): Error => {
     if (opts?.configFile) {
       msg = `error reading ${opts.configFile}: ${msg}`
@@ -267,7 +333,7 @@ export const parse = (
     return new Error(msg)
   }
 
-  const args: Args = { _: [] }
+  const args: UserProvidedArgs = {}
   let ended = false
 
   for (let i = 0; i < argv.length; ++i) {
@@ -281,17 +347,17 @@ export const parse = (
 
     // Options start with a dash and require a value if non-boolean.
     if (!ended && arg.startsWith("-")) {
-      let key: keyof Args | undefined
+      let key: keyof UserProvidedArgs | undefined
       let value: string | undefined
       if (arg.startsWith("--")) {
         const split = splitOnFirstEquals(arg.replace(/^--/, ""))
-        key = split[0] as keyof Args
+        key = split[0] as keyof UserProvidedArgs
         value = split[1]
       } else {
         const short = arg.replace(/^-/, "")
         const pair = Object.entries(options).find(([, v]) => v.short === short)
         if (pair) {
-          key = pair[0] as keyof Args
+          key = pair[0] as keyof UserProvidedArgs
         }
       }
 
@@ -305,6 +371,10 @@ export const parse = (
 
       if (key === "hashed-password" && !opts?.configFile) {
         throw new Error("--hashed-password can only be set in the config file or passed in via $HASHED_PASSWORD")
+      }
+
+      if (key === "github-auth" && !opts?.configFile) {
+        throw new Error("--github-auth can only be set in the config file or passed in via $GITHUB_TOKEN")
       }
 
       const option = options[key]
@@ -366,6 +436,10 @@ export const parse = (
     }
 
     // Everything else goes into _.
+    if (typeof args._ === "undefined") {
+      args._ = []
+    }
+
     args._.push(arg)
   }
 
@@ -374,11 +448,28 @@ export const parse = (
     throw new Error("--cert-key is missing")
   }
 
-  logger.debug(() => ["parsed command line", field("args", { ...args, password: undefined })])
+  logger.debug(() => [`parsed ${opts?.configFile ? "config" : "command line"}`, field("args", redactArgs(args))])
 
   return args
 }
 
+/**
+ * Redact sensitive information from arguments for logging.
+ */
+export const redactArgs = (args: UserProvidedArgs): UserProvidedArgs => {
+  return {
+    ...args,
+    password: args.password ? "<redacted>" : undefined,
+    "hashed-password": args["hashed-password"] ? "<redacted>" : undefined,
+    "github-auth": args["github-auth"] ? "<redacted>" : undefined,
+  }
+}
+
+/**
+ * User-provided arguments with defaults.  The distinction between user-provided
+ * args and defaulted args exists so we can tell the difference between end
+ * values and what the user actually provided on the command line.
+ */
 export interface DefaultedArgs extends ConfigArgs {
   auth: AuthType
   cert?: {
@@ -392,6 +483,9 @@ export interface DefaultedArgs extends ConfigArgs {
   usingEnvHashedPassword: boolean
   "extensions-dir": string
   "user-data-dir": string
+  "session-socket": string
+  /* Positional arguments. */
+  _: string[]
 }
 
 /**
@@ -399,7 +493,7 @@ export interface DefaultedArgs extends ConfigArgs {
  * with the defaults set. Arguments from the CLI are prioritized over config
  * arguments.
  */
-export async function setDefaults(cliArgs: Args, configArgs?: ConfigArgs): Promise<DefaultedArgs> {
+export async function setDefaults(cliArgs: UserProvidedArgs, configArgs?: ConfigArgs): Promise<DefaultedArgs> {
   const args = Object.assign({}, configArgs || {}, cliArgs)
 
   if (!args["user-data-dir"]) {
@@ -409,6 +503,11 @@ export async function setDefaults(cliArgs: Args, configArgs?: ConfigArgs): Promi
   if (!args["extensions-dir"]) {
     args["extensions-dir"] = path.join(args["user-data-dir"], "extensions")
   }
+
+  if (!args["session-socket"]) {
+    args["session-socket"] = path.join(args["user-data-dir"], "code-server-ipc.sock")
+  }
+  process.env.CODE_SERVER_SESSION_SOCKET = args["session-socket"]
 
   // --verbose takes priority over --log and --log takes priority over the
   // environment variable.
@@ -440,7 +539,7 @@ export async function setDefaults(cliArgs: Args, configArgs?: ConfigArgs): Promi
       args.verbose = false
       break
     case LogLevel.Warn:
-      logger.level = Level.Warning
+      logger.level = Level.Warn
       args.verbose = false
       break
     case LogLevel.Error:
@@ -454,19 +553,9 @@ export async function setDefaults(cliArgs: Args, configArgs?: ConfigArgs): Promi
     args.auth = AuthType.Password
   }
 
-  const addr = bindAddrFromAllSources(configArgs || { _: [] }, cliArgs)
+  const addr = bindAddrFromAllSources(configArgs || {}, cliArgs)
   args.host = addr.host
   args.port = addr.port
-
-  // If we're being exposed to the cloud, we listen on a random address and
-  // disable auth.
-  if (args.link) {
-    args.host = "localhost"
-    args.port = 0
-    args.socket = undefined
-    args.cert = undefined
-    args.auth = AuthType.None
-  }
 
   if (args.cert && !args.cert.value) {
     const { cert, certKey } = await generateCertificate(args["cert-host"] || "localhost")
@@ -481,19 +570,53 @@ export async function setDefaults(cliArgs: Args, configArgs?: ConfigArgs): Promi
     args.password = process.env.PASSWORD
   }
 
+  if (process.env.CS_DISABLE_FILE_DOWNLOADS?.match(/^(1|true)$/)) {
+    args["disable-file-downloads"] = true
+  }
+
+  if (process.env.CS_DISABLE_GETTING_STARTED_OVERRIDE?.match(/^(1|true)$/)) {
+    args["disable-getting-started-override"] = true
+  }
+
+  if (process.env.CS_DISABLE_PROXY?.match(/^(1|true)$/)) {
+    args["disable-proxy"] = true
+  }
+
   const usingEnvHashedPassword = !!process.env.HASHED_PASSWORD
   if (process.env.HASHED_PASSWORD) {
     args["hashed-password"] = process.env.HASHED_PASSWORD
     usingEnvPassword = false
   }
 
+  if (process.env.GITHUB_TOKEN) {
+    args["github-auth"] = process.env.GITHUB_TOKEN
+  }
+
   // Ensure they're not readable by child processes.
   delete process.env.PASSWORD
   delete process.env.HASHED_PASSWORD
+  delete process.env.GITHUB_TOKEN
 
   // Filter duplicate proxy domains and remove any leading `*.`.
   const proxyDomains = new Set((args["proxy-domain"] || []).map((d) => d.replace(/^\*\./, "")))
-  args["proxy-domain"] = Array.from(proxyDomains)
+  const finalProxies = []
+
+  for (const proxyDomain of proxyDomains) {
+    if (!proxyDomain.includes("{{port}}")) {
+      finalProxies.push("{{port}}." + proxyDomain)
+    } else {
+      finalProxies.push(proxyDomain)
+    }
+  }
+
+  // all proxies are of format anyprefix-{{port}}-anysuffix.{{host}}, where {{host}} is optional
+  // e.g. code-8080.domain.tld would match for code-{{port}}.domain.tld and code-{{port}}.{{host}}
+  if (finalProxies.length > 0 && !process.env.VSCODE_PROXY_URI) {
+    process.env.VSCODE_PROXY_URI = `//${finalProxies[0]}`
+  }
+  args["proxy-domain"] = finalProxies
+
+  args._ = getResolvedPathsFromArgs(args)
 
   return {
     ...args,
@@ -502,15 +625,30 @@ export async function setDefaults(cliArgs: Args, configArgs?: ConfigArgs): Promi
   } as DefaultedArgs // TODO: Technically no guarantee this is fulfilled.
 }
 
-async function defaultConfigFile(): Promise<string> {
+export function getResolvedPathsFromArgs(args: UserProvidedArgs): string[] {
+  return (args._ ?? []).map((p) => path.resolve(p))
+}
+
+/**
+ * Helper function to return the default config file.
+ *
+ * @param {string} password - Password passed in (usually from generatePassword())
+ * @returns The default config file:
+ *
+ * - bind-addr: 127.0.0.1:8080
+ * - auth: password
+ * - password: <password>
+ * - cert: false
+ */
+export function defaultConfigFile(password: string): string {
   return `bind-addr: 127.0.0.1:8080
 auth: password
-password: ${await generatePassword()}
+password: ${password}
 cert: false
 `
 }
 
-interface ConfigArgs extends Args {
+interface ConfigArgs extends UserProvidedArgs {
   config: string
 }
 
@@ -530,11 +668,12 @@ export async function readConfigFile(configPath?: string): Promise<ConfigArgs> {
   await fs.mkdir(path.dirname(configPath), { recursive: true })
 
   try {
-    await fs.writeFile(configPath, await defaultConfigFile(), {
+    const generatedPassword = await generatePassword()
+    await fs.writeFile(configPath, defaultConfigFile(generatedPassword), {
       flag: "wx", // wx means to fail if the path exists.
     })
-    logger.info(`Wrote default config file to ${humanPath(configPath)}`)
-  } catch (error) {
+    logger.info(`Wrote default config file to ${configPath}`)
+  } catch (error: any) {
     // EEXIST is fine; we don't want to overwrite existing configurations.
     if (error.code !== "EEXIST") {
       throw error
@@ -551,10 +690,10 @@ export async function readConfigFile(configPath?: string): Promise<ConfigArgs> {
  */
 export function parseConfigFile(configFile: string, configPath: string): ConfigArgs {
   if (!configFile) {
-    return { _: [], config: configPath }
+    return { config: configPath }
   }
 
-  const config = yaml.load(configFile, {
+  const config = load(configFile, {
     filename: configPath,
   })
   if (!config || typeof config === "string") {
@@ -594,10 +733,17 @@ interface Addr {
   port: number
 }
 
-function bindAddrFromArgs(addr: Addr, args: Args): Addr {
+/**
+ * This function creates the bind address
+ * using the CLI args.
+ */
+export function bindAddrFromArgs(addr: Addr, args: UserProvidedArgs): Addr {
   addr = { ...addr }
   if (args["bind-addr"]) {
     addr = parseBindAddr(args["bind-addr"])
+  }
+  if (process.env.CODE_SERVER_HOST) {
+    addr.host = process.env.CODE_SERVER_HOST
   }
   if (args.host) {
     addr.host = args.host
@@ -612,7 +758,7 @@ function bindAddrFromArgs(addr: Addr, args: Args): Addr {
   return addr
 }
 
-function bindAddrFromAllSources(...argsConfig: Args[]): Addr {
+function bindAddrFromAllSources(...argsConfig: UserProvidedArgs[]): Addr {
   let addr: Addr = {
     host: "localhost",
     port: 8080,
@@ -625,51 +771,88 @@ function bindAddrFromAllSources(...argsConfig: Args[]): Addr {
   return addr
 }
 
-export const shouldRunVsCodeCli = (args: Args): boolean => {
-  return !!args["list-extensions"] || !!args["install-extension"] || !!args["uninstall-extension"]
-}
-
 /**
  * Determine if it looks like the user is trying to open a file or folder in an
  * existing instance. The arguments here should be the arguments the user
- * explicitly passed on the command line, not defaults or the configuration.
+ * explicitly passed on the command line, *NOT DEFAULTS* or the configuration.
  */
-export const shouldOpenInExistingInstance = async (args: Args): Promise<string | undefined> => {
+export const shouldOpenInExistingInstance = async (
+  args: UserProvidedArgs,
+  sessionSocket: string,
+): Promise<string | undefined> => {
   // Always use the existing instance if we're running from VS Code's terminal.
   if (process.env.VSCODE_IPC_HOOK_CLI) {
+    logger.debug("Found VSCODE_IPC_HOOK_CLI")
     return process.env.VSCODE_IPC_HOOK_CLI
   }
 
-  const readSocketPath = async (): Promise<string | undefined> => {
-    try {
-      return await fs.readFile(path.join(os.tmpdir(), "vscode-ipc"), "utf8")
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        throw error
-      }
-    }
-    return undefined
-  }
+  const paths = getResolvedPathsFromArgs(args)
+  const client = new EditorSessionManagerClient(sessionSocket)
 
   // If these flags are set then assume the user is trying to open in an
-  // existing instance since these flags have no effect otherwise.
+  // existing instance since these flags have no effect otherwise.  That means
+  // if there is no existing instance we should error rather than falling back
+  // to spawning code-server normally.
   const openInFlagCount = ["reuse-window", "new-window"].reduce((prev, cur) => {
-    return args[cur as keyof Args] ? prev + 1 : prev
+    return args[cur as keyof UserProvidedArgs] ? prev + 1 : prev
   }, 0)
   if (openInFlagCount > 0) {
-    return readSocketPath()
+    logger.debug("Found --reuse-window or --new-window")
+    const socketPath = await client.getConnectedSocketPath(paths[0])
+    if (!socketPath) {
+      throw new Error(`No opened code-server instances found to handle ${paths[0]}`)
+    }
+    return socketPath
   }
 
   // It's possible the user is trying to spawn another instance of code-server.
-  // Check if any unrelated flags are set (check against one because `_` always
-  // exists), that a file or directory was passed, and that the socket is
-  // active.
-  if (Object.keys(args).length === 1 && args._.length > 0) {
-    const socketPath = await readSocketPath()
-    if (socketPath && (await canConnect(socketPath))) {
+  // 1. Check if any unrelated flags are set (this should only run when
+  //    code-server is invoked exactly like this: `code-server my-file`).
+  // 2. That a file or directory was passed.
+  // 3. That the socket is active.
+  // 4. That an instance exists to handle the path (implied by #3).
+  if (Object.keys(args).length === 1 && typeof args._ !== "undefined" && args._.length > 0) {
+    if (!(await client.canConnect())) {
+      return undefined
+    }
+    const socketPath = await client.getConnectedSocketPath(paths[0])
+    if (socketPath) {
+      logger.debug("Found existing code-server socket")
       return socketPath
     }
   }
 
   return undefined
+}
+
+/**
+ * Arguments for running Code's server.
+ *
+ * A subset of ../../lib/vscode/src/vs/server/node/serverEnvironmentService.ts:90
+ */
+export interface CodeArgs extends UserProvidedCodeArgs {
+  "accept-server-license-terms"?: boolean
+  "connection-token"?: string
+  help: boolean
+  port?: string
+  version: boolean
+  "without-connection-token"?: boolean
+  "without-browser-env-var"?: boolean
+  compatibility?: string
+  log?: string[]
+}
+
+/**
+ * Convert our arguments to equivalent VS Code server arguments.
+ * Does not add any extra arguments.
+ */
+export const toCodeArgs = async (args: DefaultedArgs): Promise<CodeArgs> => {
+  return {
+    ...args,
+    /** Type casting. */
+    help: !!args.help,
+    version: !!args.version,
+    port: args.port?.toString(),
+    log: args.log ? [args.log] : undefined,
+  }
 }

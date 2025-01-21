@@ -2,7 +2,7 @@
 set -eu
 
 # code-server's automatic install script.
-# See https://coder.com/docs/code-server/v3.11.0/install
+# See https://coder.com/docs/code-server/latest/install
 
 usage() {
   arg0="$0"
@@ -23,7 +23,7 @@ The remote host must have internet access.
 ${not_curl_usage-}
 Usage:
 
-  $arg0 [--dry-run] [--version X.X.X] [--method detect] \
+  $arg0 [--dry-run] [--version X.X.X] [--edge] [--method detect] \
         [--prefix ~/.local] [--rsh ssh] [user@host]
 
   --dry-run
@@ -31,6 +31,9 @@ Usage:
 
   --version X.X.X
       Install a specific version instead of the latest.
+
+  --edge
+      Install the latest edge version instead of the latest stable version.
 
   --method [detect | standalone]
       Choose the installation method. Defaults to detect.
@@ -43,7 +46,7 @@ Usage:
       Sets the prefix used by standalone release archives. Defaults to ~/.local
       The release is unarchived into ~/.local/lib/code-server-X.X.X
       and the binary symlinked into ~/.local/bin/code-server
-      To install system wide pass ---prefix=/usr/local
+      To install system wide pass --prefix=/usr/local
 
   --rsh <bin>
       Specifies the remote shell for remote installation. Defaults to ssh.
@@ -52,7 +55,7 @@ The detection method works as follows:
   - Debian, Ubuntu, Raspbian: install the deb package from GitHub.
   - Fedora, CentOS, RHEL, openSUSE: install the rpm package from GitHub.
   - Arch Linux: install from the AUR (which pulls releases from GitHub).
-  - FreeBSD, Alpine: install from yarn/npm.
+  - FreeBSD, Alpine: install from npm.
   - macOS: install using Homebrew if installed otherwise install from GitHub.
   - All others: install the release from GitHub.
 
@@ -66,14 +69,18 @@ fall back to npm so on architectures without pre-built releases this will error.
 
 The installer will cache all downloaded assets into ~/.cache/code-server
 
-More installation docs are at https://coder.com/docs/code-server/v3.11.0/install
+More installation docs are at https://coder.com/docs/code-server/latest/install
 EOF
 }
 
 echo_latest_version() {
-  # https://gist.github.com/lukechilds/a83e1d7127b78fef38c2914c4ececc3c#gistcomment-2758860
-  version="$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/cdr/code-server/releases/latest)"
-  version="${version#https://github.com/cdr/code-server/releases/tag/}"
+  if [ "${EDGE-}" ]; then
+    version="$(curl -fsSL https://api.github.com/repos/coder/code-server/releases | awk 'match($0,/.*"html_url": "(.*\/releases\/tag\/.*)".*/)' | head -n 1 | awk -F '"' '{print $4}')"
+  else
+    # https://gist.github.com/lukechilds/a83e1d7127b78fef38c2914c4ececc3c#gistcomment-2758860
+    version="$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/coder/code-server/releases/latest)"
+  fi
+  version="${version#https://github.com/coder/code-server/releases/tag/}"
   version="${version#v}"
   echo "$version"
 }
@@ -124,6 +131,11 @@ Or, if you don't want/need a background service you can run:
 EOF
 }
 
+echo_coder_postinstall() {
+  echoh
+  echoh "Deploy code-server for your team with Coder: https://github.com/coder/coder"
+}
+
 main() {
   if [ "${TRACE-}" ]; then
     set -x
@@ -135,6 +147,7 @@ main() {
     OPTIONAL \
     ALL_FLAGS \
     RSH_ARGS \
+    EDGE \
     RSH
 
   ALL_FLAGS=""
@@ -169,6 +182,9 @@ main() {
         ;;
       --version=*)
         VERSION="$(parse_arg "$@")"
+        ;;
+      --edge)
+        EDGE=1
         ;;
       --rsh)
         RSH="$(parse_arg "$@")"
@@ -232,6 +248,7 @@ main() {
   if [ "$METHOD" = standalone ]; then
     if has_standalone; then
       install_standalone
+      echo_coder_postinstall
       exit 0
     else
       echoerr "There are no standalone releases for $ARCH"
@@ -275,6 +292,8 @@ main() {
       npm_fallback install_standalone
       ;;
   esac
+
+  echo_coder_postinstall
 }
 
 parse_arg() {
@@ -340,7 +359,7 @@ install_deb() {
   echoh "Installing v$VERSION of the $ARCH deb package from GitHub."
   echoh
 
-  fetch "https://github.com/cdr/code-server/releases/download/v$VERSION/code-server_${VERSION}_$ARCH.deb" \
+  fetch "https://github.com/coder/code-server/releases/download/v$VERSION/code-server_${VERSION}_$ARCH.deb" \
     "$CACHE_DIR/code-server_${VERSION}_$ARCH.deb"
   sudo_sh_c dpkg -i "$CACHE_DIR/code-server_${VERSION}_$ARCH.deb"
 
@@ -351,9 +370,9 @@ install_rpm() {
   echoh "Installing v$VERSION of the $ARCH rpm package from GitHub."
   echoh
 
-  fetch "https://github.com/cdr/code-server/releases/download/v$VERSION/code-server-$VERSION-$ARCH.rpm" \
+  fetch "https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-$ARCH.rpm" \
     "$CACHE_DIR/code-server-$VERSION-$ARCH.rpm"
-  sudo_sh_c rpm -i "$CACHE_DIR/code-server-$VERSION-$ARCH.rpm"
+  sudo_sh_c rpm -U "$CACHE_DIR/code-server-$VERSION-$ARCH.rpm"
 
   echo_systemd_postinstall rpm
 }
@@ -368,7 +387,7 @@ install_aur() {
   if [ ! "${DRY_RUN-}" ]; then
     cd "$CACHE_DIR/code-server-aur"
   fi
-  sh_c makepkg -si
+  sh_c makepkg -si --noconfirm
 
   echo_systemd_postinstall AUR
 }
@@ -377,7 +396,7 @@ install_standalone() {
   echoh "Installing v$VERSION of the $ARCH release from GitHub."
   echoh
 
-  fetch "https://github.com/cdr/code-server/releases/download/v$VERSION/code-server-$VERSION-$OS-$ARCH.tar.gz" \
+  fetch "https://github.com/coder/code-server/releases/download/v$VERSION/code-server-$VERSION-$OS-$ARCH.tar.gz" \
     "$CACHE_DIR/code-server-$VERSION-$OS-$ARCH.tar.gz"
 
   # -w only works if the directory exists so try creating it first. If this
@@ -405,35 +424,25 @@ install_standalone() {
 }
 
 install_npm() {
-  echoh "Installing latest from npm."
+  echoh "Installing v$VERSION from npm."
   echoh
 
-  YARN_PATH="${YARN_PATH-yarn}"
   NPM_PATH="${YARN_PATH-npm}"
-  if command_exists "$YARN_PATH"; then
-    sh_c="sh_c"
-    if [ ! "${DRY_RUN-}" ] && [ ! -w "$($YARN_PATH global bin)" ]; then
-      sh_c="sudo_sh_c"
-    fi
-    echoh "Installing with yarn."
-    echoh
-    "$sh_c" "$YARN_PATH" global add code-server --unsafe-perm
-    NPM_BIN_DIR="\$($YARN_PATH global bin)" echo_npm_postinstall
-    return
-  elif command_exists "$NPM_PATH"; then
+
+  if command_exists "$NPM_PATH"; then
     sh_c="sh_c"
     if [ ! "${DRY_RUN-}" ] && [ ! -w "$(NPM_PATH config get prefix)" ]; then
       sh_c="sudo_sh_c"
     fi
     echoh "Installing with npm."
     echoh
-    "$sh_c" "$NPM_PATH" install -g code-server --unsafe-perm
+    "$sh_c" "$NPM_PATH" install -g "code-server@$VERSION" --unsafe-perm
     NPM_BIN_DIR="\$($NPM_PATH bin -g)" echo_npm_postinstall
     return
   fi
-  echoerr "Please install npm or yarn to install code-server!"
-  echoerr "You will need at least node v12 and a few C dependencies."
-  echoerr "See the docs https://coder.com/docs/code-server/v3.11.0/install#yarn-npm"
+  echoerr "Please install npm to install code-server!"
+  echoerr "You will need at least node v20 and a few C dependencies."
+  echoerr "See the docs https://coder.com/docs/code-server/latest/install#npm"
 
   exit 1
 }
@@ -452,9 +461,9 @@ npm_fallback() {
 # Determine if we have standalone releases on GitHub for the system's arch.
 has_standalone() {
   case $ARCH in
-    amd64) return 0 ;;
-    # We only have amd64 for macOS.
-    arm64)
+    arm64) return 0 ;;
+    # We only have arm64 for macOS.
+    amd64)
       [ "$(distro)" != macos ]
       return
       ;;
@@ -481,7 +490,7 @@ os() {
 # - amzn, centos, rhel, fedora, ... -> fedora
 # - opensuse-{leap,tumbleweed} -> opensuse
 # - alpine -> alpine
-# - arch -> arch
+# - arch, manjaro, endeavouros, ... -> arch
 #
 # Inspired by https://github.com/docker/docker-install/blob/26ff363bcf3b3f5a00498ac43694bf1c7d9ce16c/install.sh#L111-L120.
 distro() {
@@ -495,7 +504,7 @@ distro() {
       . /etc/os-release
       if [ "${ID_LIKE-}" ]; then
         for id_like in $ID_LIKE; do
-          case "$id_like" in debian | fedora | opensuse)
+          case "$id_like" in debian | fedora | opensuse | arch)
             echo "$id_like"
             return
             ;;
@@ -552,15 +561,17 @@ sh_c() {
 sudo_sh_c() {
   if [ "$(id -u)" = 0 ]; then
     sh_c "$@"
+  elif command_exists doas; then
+    sh_c "doas $*"
   elif command_exists sudo; then
     sh_c "sudo $*"
   elif command_exists su; then
-    sh_c "su - -c '$*'"
+    sh_c "su root -c '$*'"
   else
     echoh
     echoerr "This script needs to run the following command as root."
     echoerr "  $*"
-    echoerr "Please install sudo or su."
+    echoerr "Please install doas, sudo, or su."
     exit 1
   fi
 }
